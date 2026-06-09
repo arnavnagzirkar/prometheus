@@ -3268,6 +3268,47 @@ func TestPostingsForMatchers(t *testing.T) {
 				labels.FromStrings("n", "2.5"),
 			},
 		},
+		// Multiple !~ for same label get merged.
+		{
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchNotRegexp, "n", "1"),
+				labels.MustNewMatcher(labels.MatchNotRegexp, "n", "2"),
+			},
+			exp: []labels.Labels{
+				labels.FromStrings("n", "2.5"),
+			},
+		},
+		// Multiple != for same label get merged.
+		{
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchNotEqual, "n", "1"),
+				labels.MustNewMatcher(labels.MatchNotEqual, "n", "2"),
+			},
+			exp: []labels.Labels{
+				labels.FromStrings("n", "2.5"),
+			},
+		},
+		// Mixed !~ and != for same label get merged.
+		{
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchNotRegexp, "n", "1"),
+				labels.MustNewMatcher(labels.MatchNotEqual, "n", "2"),
+			},
+			exp: []labels.Labels{
+				labels.FromStrings("n", "2.5"),
+			},
+		},
+		// Multiple !~ for same label, combined with another matcher for different label.
+		{
+			matchers: []*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchNotRegexp, "n", "1"),
+				labels.MustNewMatcher(labels.MatchNotRegexp, "n", "2\\.5"),
+				labels.MustNewMatcher(labels.MatchEqual, "i", ""),
+			},
+			exp: []labels.Labels{
+				labels.FromStrings("n", "2"),
+			},
+		},
 	}
 
 	ir, err := h.Index()

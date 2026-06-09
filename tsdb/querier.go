@@ -18,7 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
+	"strings"
 
 	"github.com/oklog/ulid/v2"
 
@@ -261,6 +263,87 @@ func selectChunkSeriesSet(ctx context.Context, sortSeries bool, hints *storage.S
 	return NewBlockChunkSeriesSet(blockID, index, chunks, tombstones, p, mint, maxt, disableTrimming)
 }
 
+// mergeMatchersForSameLabelName combines multiple !~ or != matchers for the same
+// label name into a single !~ matcher, reducing the number of label value scans.
+// For example {l!~"a", l!~"b"} becomes {l!~"(?:a)|(?:b)"} and
+// {l!="a", l!="b"} becomes {l!~"(?:a)|(?:b)"}.
+// By De Morgan's law, NOT(a) AND NOT(b) == NOT(a OR b), so combining with | is correct.
+func mergeMatchersForSameLabelName(ms []*labels.Matcher) []*labels.Matcher {
+	type negMatchers struct {
+		notRegexp []*labels.Matcher
+		notEqual  []*labels.Matcher
+	}
+	negByName := make(map[string]*negMatchers, len(ms))
+
+	for _, m := range ms {
+		if m.Type != labels.MatchNotRegexp && m.Type != labels.MatchNotEqual {
+			continue
+		}
+		if negByName[m.Name] == nil {
+			negByName[m.Name] = &negMatchers{}
+		}
+		if m.Type == labels.MatchNotRegexp {
+			negByName[m.Name].notRegexp = append(negByName[m.Name].notRegexp, m)
+		} else {
+			negByName[m.Name].notEqual = append(negByName[m.Name].notEqual, m)
+		}
+	}
+
+	// Check if there's anything to merge.
+	canMerge := false
+	for _, neg := range negByName {
+		if len(neg.notRegexp)+len(neg.notEqual) > 1 {
+			canMerge = true
+			break
+		}
+	}
+	if !canMerge {
+		return ms
+	}
+
+	result := make([]*labels.Matcher, 0, len(ms))
+	merged := make(map[string]bool, len(negByName))
+
+	for _, m := range ms {
+		if m.Type != labels.MatchNotRegexp && m.Type != labels.MatchNotEqual {
+			result = append(result, m)
+			continue
+		}
+
+		neg := negByName[m.Name]
+		total := len(neg.notRegexp) + len(neg.notEqual)
+		if total <= 1 {
+			result = append(result, m)
+			continue
+		}
+
+		if merged[m.Name] {
+			continue
+		}
+		merged[m.Name] = true
+
+		// Build a combined regex from all negative matchers for this label.
+		parts := make([]string, 0, total)
+		for _, nm := range neg.notRegexp {
+			parts = append(parts, "(?:"+nm.Value+")")
+		}
+		for _, nm := range neg.notEqual {
+			parts = append(parts, "(?:"+regexp.QuoteMeta(nm.Value)+")")
+		}
+
+		combined, err := labels.NewMatcher(labels.MatchNotRegexp, m.Name, strings.Join(parts, "|"))
+		if err != nil {
+			// Combining failed; add the original matchers back unchanged.
+			result = append(result, neg.notRegexp...)
+			result = append(result, neg.notEqual...)
+			continue
+		}
+		result = append(result, combined)
+	}
+
+	return result
+}
+
 // PostingsForMatchers assembles a single postings iterator against the index reader
 // based on the given matchers. The resulting postings are not ordered by series.
 func PostingsForMatchers(ctx context.Context, ix IndexReader, ms ...*labels.Matcher) (index.Postings, error) {
@@ -268,6 +351,8 @@ func PostingsForMatchers(ctx context.Context, ix IndexReader, ms ...*labels.Matc
 		k, v := index.AllPostingsKey()
 		return ix.Postings(ctx, k, v)
 	}
+
+	ms = mergeMatchersForSameLabelName(ms)
 
 	var its, notIts []index.Postings
 	// See which label must be non-empty.
